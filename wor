@@ -1,0 +1,424 @@
+import streamlit as st
+import openai
+import os
+import json
+import glob
+import time # 用于模拟操作耗时或添加少量延迟，有时有助于UI更新
+
+# --- DeepSeek API 配置 ---
+# 建议通过环境变量设置 API Key
+openai.api_key = os.getenv("DEEPSEEK_API_KEY")
+# 按照你的反馈，暂时保留此地址，因为你提到 /v1 会返回 404
+openai.base_url = "https://api.deepseek.com"
+openai.timeout = 60.0 # 增加API请求超时时间，防止网络不稳定导致请求失败
+
+# 检查 API Key 是否已设置，如果未设置则停止应用并显示错误
+if openai.api_key is None:
+    st.error("错误：DEEPSEEK_API_KEY 环境变量未设置。")
+    st.markdown("请在运行 Streamlit 应用前设置此环境变量。例如：")
+    st.code("export DEEPSEEK_API_KEY=\"sk-YOUR_API_KEY_HERE\" # Linux/macOS")
+    st.code("set DEEPSEEK_API_KEY=\"sk-YOUR_API_KEY_HERE\" # Windows CMD")
+    st.code("$env:DEEPSEEK_API_KEY=\"sk-YOUR_API_KEY_HERE\" # Windows PowerShell")
+    st.stop() # 停止 Streamlit 应用的运行
+
+# --- 定义通用的图片文件扩展名列表 ---
+IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp']
+
+# --- 本地工具函数实现 ---
+# 这些函数是 AI 通过 MCP 调用的“身体”
+def read_local_file(file_path):
+    """
+    读取用户本地指定路径的文本文件内容。
+    """
+    if not os.path.exists(file_path):
+        return {"error": f"文件不存在：{file_path}"}
+    if not os.path.isfile(file_path):
+        return {"error": f"这不是一个文件：{file_path}"}
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return {"success": True, "content": content}
+    except Exception as e:
+        return {"error": f"读取文件失败：{str(e)}"}
+
+def create_text_file(file_path, content):
+    """
+    在本地创建或覆盖文本文件。
+    """
+    try:
+        # 获取文件路径中的目录部分
+        directory = os.path.dirname(file_path)
+        # 如果目录不存在，则创建它
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True) # exist_ok=True 避免目录已存在时报错
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return {"success": True, "message": f"文件 '{file_path}' 已成功创建/更新。"}
+    except Exception as e:
+        return {"error": f"创建/写入文件失败：{str(e)}"}
+
+def batch_rename_images(folder_path, naming_rule, base_name=None, start_number=1):
+    """
+    根据指定规则批量重命名文件夹中的图片文件。
+    目前仅支持 'sequential'（按顺序编号）规则。
+    """
+    if not os.path.isdir(folder_path):
+        return {"error": f"指定的文件夹不存在或不是一个目录：{folder_path}"}
+
+    image_files = []
+    for ext in IMAGE_EXTENSIONS:
+        # 使用 glob 查找所有匹配扩展名的文件，并确保是文件而不是目录
+        found_files = glob.glob(os.path.join(folder_path, f'*{ext}'))
+        image_files.extend([f for f in found_files if os.path.isfile(f)])
+    
+    image_files.sort() # 按文件名排序，确保顺序编号的逻辑一致性
+
+    if not image_files:
+        return {"message": f"在文件夹 '{folder_path}' 中未找到任何支持的图片文件。"}
+
+    results = []
+    try:
+        if naming_rule == "sequential":
+            if not base_name:
+                return {"error": "当规则为 'sequential' 时，'base_name' 参数不能为空。"}
+            
+            # 确定新文件名的数字位数，例如如果总共有123张图，start_number是1，则最大编号是123，需要3位（001, 002...）
+            num_digits = len(str(len(image_files) + start_number - 1)) 
+
+            for i, old_path in enumerate(image_files):
+                _ , ext = os.path.splitext(os.path.basename(old_path)) # 只保留扩展名
+                
+                new_name = f"{base_name}-{str(start_number + i).zfill(num_digits)}{ext}"
+                new_path = os.path.join(folder_path, new_name)
+                
+                # 检查新路径是否与旧路径相同（避免不必要的重命名操作，例如重复运行）
+                if os.path.exists(new_path) and os.path.samefile(old_path, new_path):
+                    results.append({"original": os.path.basename(old_path), "new": "未改变 (新旧文件名相同)"})
+                else:
+                    os.rename(old_path, new_path)
+                    results.append({"original": os.path.basename(old_path), "new": new_name})
+
+            return {"success": True, "message": f"成功按顺序重命名 {len(results)} 张图片。", "details": results}
+
+        else:
+            return {"error": f"不支持的重命名规则：{naming_rule}。当前仅支持 'sequential' 顺序编号重命名。"}
+
+    except Exception as e:
+        # 打印详细错误信息到日志（如果需要）
+        # import traceback
+        # traceback.print_exc()
+        return {"error": f"重命名过程中发生错误：{str(e)}"}
+
+# --- 映射工具名到实际的函数 ---
+# 确保所有函数在此字典定义之前被定义
+available_functions = {
+    "read_local_file": read_local_file,
+    "create_text_file": create_text_file,
+    "batch_rename_images": batch_rename_images
+}
+
+# --- DeepSeek AI 可用的工具定义（MCP 协议）---
+# 将所有工具的描述都包含在此列表中，用于告诉 AI 它能做什么
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_local_file",
+            "description": "读取用户本地指定路径的文本文件内容。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "要读取的文件的绝对路径，例如 '/Users/User/Documents/my_doc.txt' 或 'C:\\data\\log.txt'"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_text_file",
+            "description": "在用户本地创建或覆盖文本文件。如果父目录不存在，将尝试创建。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "要创建或覆盖的文件的绝对路径，例如 '/Users/User/Documents/new_report.txt' 或 'C:\\data\\temp\\report.txt'"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "要写入文件的文本内容。"
+                    }
+                },
+                "required": ["file_path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "batch_rename_images",
+            "description": "根据指定规则批量重命名文件夹中的图片文件。目前只支持按顺序编号重命名。请务必提供包含图片的完整文件夹的**绝对路径**。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "folder_path": {
+                        "type": "string",
+                        "description": "包含要重命名的图片的文件夹的绝对路径，例如 'C:\\Users\\YourName\\Pictures\\旅行照片' 或 '/Users/YourName/Desktop/我的图片'"
+                    },
+                    "naming_rule": {
+                        "type": "string",
+                        "description": "重命名规则。'sequential' 表示按顺序编号。",
+                        "enum": ["sequential"] # 明确只支持 sequential
+                    },
+                    "base_name": {
+                        "type": "string",
+                        "description": "当 naming_rule 为 'sequential' 时，指定新文件名的基础部分，例如 '照片'。",
+                        "nullable": True
+                    },
+                    "start_number": {
+                        "type": "integer",
+                        "description": "当 naming_rule 为 'sequential' 时，指定起始编号（例如 1）。",
+                        "default": 1,
+                        "nullable": True
+                    }
+                },
+                "required": ["folder_path", "naming_rule", "base_name"] # 确保 base_name 也是必填项
+            }
+        }
+    }
+]
+
+# --- Streamlit 界面构建 ---
+st.set_page_config(page_title="AI 文件与照片助手", layout="centered")
+st.title("🗂️ AI 文件与照片助手")
+
+st.markdown("""
+这个智能助手可以帮你完成以下任务：
+* **读取本地文本文件内容**
+* **创建或修改本地文本文件**
+* **批量按顺序重命名文件夹中的图片** (例如：`我的照片-001.jpg`, `我的照片-002.jpg`)
+
+请在下方输入你的指令。
+""")
+
+# 初始化 Streamlit session_state 中的消息历史和聊天历史
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "system", "content": "你是一个智能文件与照片助手，可以帮助我读取、创建文本文件，以及批量重命名图片。当你需要调用工具时，请使用提供的工具，并确保提供完整且正确的路径和必要参数。"}
+    ]
+    st.session_state.chat_history = [] # 用于在UI上显示给用户的对话历史
+
+# 显示之前的对话历史
+for message in st.session_state.chat_history:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# 获取用户输入
+user_input = st.chat_input("输入你的指令...")
+
+# 在某个合适的位置，比如 st.chat_input 之前或之后
+if st.button("开始新对话"):
+    st.session_state.messages = [
+        {"role": "system", "content": "你是一个智能文件与照片助手，可以帮助我读取、创建文本文件，以及批量重命名图片。当你需要调用工具时，请使用提供的工具，并确保提供完整且正确的路径和必要参数。"}
+    ]
+    st.session_state.chat_history = []
+    st.experimental_rerun() # 重新运行应用以更新UI
+
+if user_input:
+    # 1. 将用户输入添加到 Streamlit 的聊天历史和 DeepSeek 的消息历史中
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+    st.session_state.messages.append({"role": "user", "content": user_input})
+
+    with st.spinner("AI 正在思考..."): # 显示加载动画
+        # 核心逻辑包裹在一个大的 try 块中，捕获所有API和运行时错误
+        try: 
+            with st.status("正在与 DeepSeek AI 交互...", expanded=True) as status_message:
+                # Debugging 1: Show messages before first API call
+                status_message.write("--- DeepSeek API 调用前（消息历史） ---")
+                for msg in st.session_state.messages:
+                    status_message.write(msg)
+                status_message.write("------------------------------------")
+                print("\n--- CONSOLE LOG: MESSAGES BEFORE FIRST API CALL ---")
+                
+                status_message.write("发起第一次 DeepSeek API 请求...")
+                for msg in st.session_state.messages:
+                    print(msg)
+                print("--------------------------------------------------\n")
+                # 2. 第一次调用 DeepSeek AI，让其决定是否需要工具调用
+                response = openai.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=st.session_state.messages,
+                    tools=tools, # 传递所有定义的工具列表
+                    tool_choice="auto" # 允许模型自动选择是否使用工具
+                )
+                status_message.write("第一次 DeepSeek API 请求完成。")
+
+                response_message = response.choices[0].message
+                tool_calls = response_message.tool_calls
+
+                # 3. 处理 AI 的直接回复（如果有的话）
+                # 如果 AI 有文本内容回复，先显示它，并将其添加到 DeepSeek 的消息历史
+                if response_message.content:
+                    st.session_state.chat_history.append({"role": "assistant", "content": response_message.content})
+                    # 将此消息添加到 DeepSeek 的内部历史，以便它能记住
+                    st.session_state.messages.append(response_message)
+                    with st.chat_message("assistant"):
+                        st.markdown(response_message.content)
+                    status_message.update(label="DeepSeek AI 已回复", state="complete", expanded=False)
+                    st.rerun() # 立即刷新UI显示AI的直接回复
+
+
+                # 4. 如果 DeepSeek 决定调用工具
+                if tool_calls:
+                    # 关键步骤：确保包含 tool_calls 的 response_message 被添加到 DeepSeek 的消息历史中
+                    # 只有当此 response_message 是纯粹的工具调用（即没有 content）时，才在这里添加。
+                    # 如果它有 content，那么已经在上面的 if block 中被添加了。
+                    if not response_message.content:
+                        st.session_state.messages.append(response_message) # 记录 AI 决定调用工具这一事实
+
+                    # Debugging 2: Show messages after AI's tool_calls message is appended
+                    status_message.write("--- AI 决定调用工具后（消息历史） ---")
+                    for msg in st.session_state.messages:
+                        status_message.write(msg)
+                    status_message.write("------------------------------------")
+                    print("\n--- CONSOLE LOG: MESSAGES AFTER AI'S TOOL_CALLS MESSAGE ---")
+                    for msg in st.session_state.messages:
+                        print(msg)
+                    print("----------------------------------------------------------\n")
+                    
+                    status_message.write("AI 决定调用工具，准备执行...")
+                    # 显示 AI 正在准备调用工具的提示
+                    tool_request_msg = "AI 正在准备调用工具..."
+                    st.session_state.chat_history.append({"role": "assistant", "content": tool_request_msg})
+                    with st.chat_message("assistant"):
+                        st.markdown(tool_request_msg)
+                    #st.rerun() # 立即刷新UI显示AI的思考过程（如“AI 正在准备调用工具...”）
+
+                    # 5. 遍历并执行所有工具调用
+                    for tool_call in tool_calls:
+                        function_name = tool_call.function.name
+                        function_to_call = available_functions.get(function_name)
+
+                        if function_to_call:
+                            # 解析工具调用的参数
+                            function_args = json.loads(tool_call.function.arguments)
+                            
+                            # 使用 st.status 来显示工具执行进度
+                            with st.status(f"正在执行工具：`{function_name}`", expanded=True) as tool_exec_status:
+                                tool_exec_status.write(f"参数：`{function_args}`")
+                                
+                                # 显示正在执行工具的信息
+                                tool_log_msg = f"AI 正在执行工具：`{function_name}`，参数：`{function_args}`"
+                                st.session_state.chat_history.append({"role": "assistant", "content": tool_log_msg})
+                                # 注意：这里不 st.rerun()，让 st.status 来控制 UI 刷新
+                                
+                                # 执行本地工具函数
+                                tool_output = function_to_call(**function_args)
+                                
+                                # 显示工具执行结果
+                                tool_output_msg = f"工具 `{function_name}` 执行完毕，结果：\n```json\n{json.dumps(tool_output, indent=2, ensure_ascii=False)}\n```"
+                                st.session_state.chat_history.append({"role": "assistant", "content": tool_output_msg})
+                                # 注意：这里不 st.rerun()
+                                
+                                with st.chat_message("assistant"):
+                                    st.markdown(tool_output_msg)
+
+                                # 更新 st.status 的状态
+                                tool_exec_status.update(label=f"工具 `{function_name}` 执行成功", state="complete", expanded=False)
+
+                            # 6. 将工具的输出作为 `role="tool"` 消息添加到 DeepSeek 的消息历史中
+                            st.session_state.messages.append(
+                                {
+                                    "tool_call_id": tool_call.id, # 必须与原始 tool_call 的 ID 匹配
+                                    "role": "tool",
+                                    "name": function_name,
+                                    "content": json.dumps(tool_output, ensure_ascii=False), # 工具输出必须是 JSON 字符串
+                                }
+                            )
+                        else:
+                            # 处理未知工具的情况
+                            error_msg = f"AI 错误：未知的工具 '{function_name}'。"
+                            st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
+                            st.session_state.messages.append({"role": "tool", "name": function_name, "content": error_msg})
+                            with st.chat_message("assistant"):
+                                st.error(error_msg)
+                            st.rerun() # 立即刷新，显示未知工具错误
+
+                    # Debugging 3: Show messages after tool's response message is appended
+                    status_message.write("--- 工具结果添加后（消息历史） ---")
+                    for msg in st.session_state.messages:
+                        status_message.write(msg)
+                    status_message.write("------------------------------------")
+                    print("\n--- CONSOLE LOG: MESSAGES BEFORE SECOND API CALL (After Tool Output) ---")
+                    for msg in st.session_state.messages:
+                        print(msg)
+                    print("----------------------------------------------------------------------\n")
+
+                    status_message.write("所有工具执行完毕，正在向 DeepSeek 回传结果并获取最终回复...")
+                    # 7. 第二次调用 DeepSeek AI，让其基于工具结果生成最终回复
+                    final_response = openai.chat.completions.create(
+                        model="deepseek-chat",
+                        messages=st.session_state.messages # 此时的 messages 列表包含了完整的工具调用和结果历史
+                    )
+                    status_message.write("最终回复获取成功。")
+                    final_ai_message = final_response.choices[0].message
+                    
+                    # 将最终回复添加到显示历史和 DeepSeek 的消息历史
+                    st.session_state.chat_history.append({"role": "assistant", "content": final_ai_message.content})
+                    st.session_state.messages.append(final_ai_message)
+                    with st.chat_message("assistant"):
+                        st.markdown(final_ai_message.content)
+                    
+                    status_message.update(label="DeepSeek AI 思考完成！", state="complete", expanded=False)
+                    st.rerun() 
+
+                # 如果 DeepSeek 直接给出回复，没有调用工具
+                elif not tool_calls and not response_message.content:
+                    # 这种情况通常不会发生，因为至少会有一个 content 或 tool_calls
+                    # 但作为防御性编程，以防万一
+                    st.session_state.chat_history.append({"role": "assistant", "content": "AI 没有给出明确回复，也没有调用工具。"})
+                    st.session_state.messages.append({"role": "assistant", "content": "AI 没有给出明确回复，也没有调用工具。"})
+                    with st.chat_message("assistant"):
+                        st.markdown("AI 没有给出明确回复，也没有调用工具。")
+                    status_message.update(label="DeepSeek AI 思考完成！", state="complete", expanded=False)
+                    st.rerun()
+
+        # 所有的 API 相关异常捕获都放在这个主 try 块的后面
+        except openai.APIConnectionError as e:
+            error_msg = f"无法连接到 DeepSeek API：{e}"
+            st.error(error_msg)
+            # 确保 status_message 存在且有效
+            if 'status_message' in locals():
+                status_message.update(label="API 连接错误", state="error", expanded=True)
+            st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
+            st.rerun()
+        except openai.RateLimitError as e:
+            error_msg = f"达到速率限制，请稍后再试：{e}"
+            st.error(error_msg)
+            if 'status_message' in locals():
+                status_message.update(label="速率限制错误", state="error", expanded=True)
+            st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
+            st.rerun()
+        except openai.APIStatusError as e:
+            error_msg = f"DeepSeek API 返回错误状态 {e.status_code}: {e.response.text}"
+            st.error(error_msg)
+            if 'status_message' in locals():
+                status_message.update(label="API 状态错误", state="error", expanded=True)
+            st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
+            st.rerun()
+        except Exception as e: # 捕获所有其他未知错误
+            error_msg = f"发生未知错误：{e}"
+            st.error(error_msg)
+            if 'status_message' in locals():
+                status_message.update(label="未知错误", state="error", expanded=True)
+            st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
+            st.rerun()
